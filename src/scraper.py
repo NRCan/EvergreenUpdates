@@ -29,6 +29,7 @@ class ArticleScraperGUI:
         self.urls_text = None
         self.output_file = tk.StringVar(value="news_results.csv")
         self.certificate_path = tk.StringVar(value=r"")
+        self.selected_model = tk.StringVar(value="Auto fallback")
         self.is_running = False
         self.df = None
 
@@ -74,6 +75,25 @@ class ArticleScraperGUI:
         output_entry = ttk.Entry(output_frame, textvariable=self.output_file)
         output_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
         ttk.Button(output_frame, text="Browse", command=self.browse_output).grid(row=0, column=1)
+
+        # Gemini model selection section
+        row += 1
+        ttk.Label(main_frame, text="Gemini Model:", font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky=tk.W, pady=5)
+        model_frame = ttk.Frame(main_frame)
+        model_frame.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5)
+        model_frame.columnconfigure(0, weight=1)
+
+        model_options = [
+            "Auto fallback",
+            "Gemini 3.1 Flash Lite",
+            "Gemini 3.5 Flash",
+            "Gemini 3 Flash",
+            "Gemini 2.5 Flash",
+            "Gemini 2.5 Flash Lite",
+        ]
+        self.model_selector = ttk.Combobox(model_frame, textvariable=self.selected_model, values=model_options, state="readonly")
+        self.model_selector.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        self.model_selector.set("Auto fallback")
         
         # URLs section
         row += 1
@@ -350,61 +370,115 @@ class ArticleScraperGUI:
         if len(html) > max_chars:
             html = html[:max_chars]
             self.log(f"HTML truncated to {max_chars} characters", "WARNING")
+
+        prompt = f"""You are an expert web content analyst helping policy analysts track stakeholder updates.
+
+        Your task is to extract up to 15 of the most recent articles, publications, reports, press releases, consultations, or other stakeholder updates from the provided HTML.
+
+        EXTRACTION RULES:
+        - Only extract items that are clearly distinct, linkable content pieces (not navigation links, category headers, or UI elements)
+        - Prefer items with visible publication dates; include undated items only if they appear substantive
+        - Resolve relative URLs to absolute URLs where possible; if the base domain is known from context, prepend it
+        - Normalize dates to ISO 8601 format (YYYY-MM-DD) where possible; use null if unavailable or ambiguous
+        - Deduplicate: if the same article appears multiple times, include it only once
+        - Prioritize recency — list the most recently dated items first, undated items last
+
+        OUTPUT FORMAT:
+        Return a valid JSON object with a single key 'articles'. Each article must have all three fields. Do not include markdown, code fences, or any text outside the JSON.
+
+        {{
+        "articles": [
+            {{
+            "title": "Full article title as it appears on the page",
+            "url": "https://full-absolute-url.com/path/to/article",
+            "published_date": "YYYY-MM-DD or null"
+            }}
+        ]
+        }}
+
+        IMPORTANT:
+        - Return ONLY the JSON object — no preamble, explanation, or trailing text
+        - Ensure the JSON is complete and valid (all brackets and braces closed)
+        - If no articles are found, return {{"articles": []}}
+
+        HTML:
+        {html}"""
         
-        prompt = f"""Please give me a list of UP TO 30 articles or journal publications from the following HTML, 
-        including their titles, full url, and publication dates. 
-        
-        The expected response format is a JSON object with a key 'articles', where each article is an object with:
-        - 'title': the article title (string)
-        - 'url': the article URL (string)
-        - 'published_date': the publication date if available, otherwise null
-        
-        Only include complete article entries. Do not include partial entries.
-        Ensure the JSON is properly closed with }} at the end.
-        
-        HTML: {html}"""
-        
-        try:
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-                config=genai.types.GenerateContentConfig(
-                    max_output_tokens=8192,
-                    temperature=0.1,
+        model_map = {
+            "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
+            "Gemini 3.5 Flash": "gemini-3.5-flash",
+            "Gemini 3 Flash": "gemini-3-flash",
+            "Gemini 2.5 Flash": "gemini-2.5-flash",
+            "Gemini 2.5 Flash Lite": "gemini-2.5-flash-lite",
+        }
+
+        fallback_models = [
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-3-flash",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ]
+
+        selected = self.selected_model.get()
+        if selected == "Auto fallback":
+            model_chain = fallback_models
+        else:
+            model_chain = [model_map.get(selected, selected)]
+
+        for model_name in model_chain:
+            self.log(f"Using Gemini model: {model_name}")
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=genai.types.GenerateContentConfig(
+                        max_output_tokens=8192,
+                        temperature=0.1,
+                    )
                 )
-            )
-            
-            if hasattr(response, 'candidates') and response.candidates:
-                finish_reason = response.candidates[0].finish_reason
-                self.log(f"Gemini finish reason: {finish_reason}")
-                if finish_reason == 'MAX_TOKENS':
-                    self.log("Response truncated due to max tokens!", "WARNING")
-            
-            raw_output = response.text
-            
-            if raw_output is None:
-                self.log("No output from Gemini API", "ERROR")
+
+                if hasattr(response, 'candidates') and response.candidates:
+                    finish_reason = response.candidates[0].finish_reason
+                    self.log(f"Gemini finish reason: {finish_reason}")
+                    if finish_reason == 'MAX_TOKENS':
+                        self.log("Response truncated due to max tokens!", "WARNING")
+
+                raw_output = response.text
+                if raw_output is None:
+                    self.log("No output from Gemini API", "ERROR")
+                    continue
+
+                clean_json = raw_output.strip()
+                if clean_json.startswith('```json'):
+                    clean_json = clean_json.replace('```json', '').replace('```', '').strip()
+                elif clean_json.startswith('```'):
+                    clean_json = clean_json.replace('```', '').strip()
+
+                if not clean_json.endswith('}') and not clean_json.endswith(']'):
+                    self.log("JSON appears truncated, attempting to fix...", "WARNING")
+                    open_braces = clean_json.count('{') - clean_json.count('}')
+                    open_brackets = clean_json.count('[') - clean_json.count(']')
+                    clean_json += ']' * open_brackets + '}' * open_braces
+                    self.log(f"Added {open_brackets} ] and {open_braces} }}")
+
+                self.log("JSON extraction successful")
+                return clean_json
+
+            except Exception as e:
+                error_text = str(e).lower()
+                if any(keyword in error_text for keyword in [
+                    'rate limit', 'too many requests', 'quota', 'resourceexhausted', '429', 'rate_limited', 'rate-limit'
+                ]):
+                    self.log(f"Model {model_name} rate limited or quota exceeded: {e}", "WARNING")
+                    if selected == "Auto fallback":
+                        self.log(f"Trying next model in fallback list...", "INFO")
+                        continue
+                self.log(f"Error calling Gemini API with {model_name}: {e}", "ERROR")
                 return None
-            
-            clean_json = raw_output.strip()
-            if clean_json.startswith('```json'):
-                clean_json = clean_json.replace('```json', '').replace('```', '').strip()
-            elif clean_json.startswith('```'):
-                clean_json = clean_json.replace('```', '').strip()
-            
-            if not clean_json.endswith('}') and not clean_json.endswith(']'):
-                self.log("JSON appears truncated, attempting to fix...", "WARNING")
-                open_braces = clean_json.count('{') - clean_json.count('}')
-                open_brackets = clean_json.count('[') - clean_json.count(']')
-                clean_json += ']' * open_brackets + '}' * open_braces
-                self.log(f"Added {open_brackets} ] and {open_braces} }}")
-            
-            self.log("JSON extraction successful")
-            return clean_json
-            
-        except Exception as e:
-            self.log(f"Error calling Gemini API: {e}", "ERROR")
-            return None
+
+        self.log("All Gemini models exhausted or unavailable", "ERROR")
+        return None
     
     def get_articles_from_url(self, url):
         """Main function to extract articles from a URL"""
